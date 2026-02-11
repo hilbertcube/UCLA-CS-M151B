@@ -1,0 +1,52 @@
+# Compiled Object files
+*.o
+*.obj
+
+# Compiled Executables
+*.exe
+*.out
+*.app
+
+# Libraries
+*.lib
+*.dll
+*.so
+*.a
+
+# Precompiled Headers
+*.gch
+*.pch
+ipch/
+
+# Build directories
+build/
+bin/
+GeneratedFiles/
+Debug/
+Release/
+x64/
+Win32/
+
+# Temporary files and logs
+*.log
+*.tmp
+*.cache
+*.sdf
+*.suo
+*.user
+*.aps
+*.ncb
+*.opendb
+
+# IDE-specific files (Visual Studio, CMake, CLion etc.)
+.idea/
+.vscode/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.cmake
+out/
+
+# OS specific files
+.DS_Store
+Thumbs.db
