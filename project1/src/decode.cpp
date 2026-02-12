@@ -246,8 +246,7 @@ std::shared_ptr<Instr> Core::decode(uint32_t instr_code) const {
       exe_flags.use_rs1 = 1;
       exe_flags.use_imm = 1;
       exe_flags.alu_s2_imm = 1;
-
-      // TODO
+      // I-type immediate for ALU immediates: bits 31-20, sign-extended
       imm = sext(instr_code >> 20, 12);
       break;
     case Opcode::L:
@@ -257,10 +256,8 @@ std::shared_ptr<Instr> Core::decode(uint32_t instr_code) const {
       exe_flags.use_imm = 1;
       exe_flags.alu_s2_imm = 1;
 
-      // TODO
-
-
-      imm = sext((1), 12);
+      // I-type immediate for loads and JALR: bits 31-20, sign-extended
+      imm = sext(instr_code >> 20, 12);
     } break;
     case Opcode::SYS: {
       exe_flags.use_imm = 1;
@@ -285,7 +282,13 @@ std::shared_ptr<Instr> Core::decode(uint32_t instr_code) const {
     exe_flags.use_rs2 = 1;
     exe_flags.use_imm = 1;
     exe_flags.alu_s2_imm = 1;
-    imm = 0;
+    
+
+    // fixed s type immediate
+    uint32_t imm_11_5 = (instr_code >> 25) & 0x7F;
+    uint32_t imm_4_0  = (instr_code >> 7)  & 0x1F;
+    uint32_t imm_raw  = (imm_11_5 << 5) | imm_4_0;
+    imm = sext(imm_raw, 12);
   } break;
 
   case InstType::B: {
@@ -319,7 +322,26 @@ std::shared_ptr<Instr> Core::decode(uint32_t instr_code) const {
     exe_flags.use_rd  = 1;
     exe_flags.use_imm = 1;
     exe_flags.alu_s2_imm = 1;
-    imm = // TODO:
+    // J-type immediate: imm[20|10:1|11|19:12] in bits 31-12
+    // Layout in instruction:
+    //   bit 31      -> imm[20]
+    //   bits 30-21  -> imm[10:1]
+    //   bit 20      -> imm[11]
+    //   bits 19-12  -> imm[19:12]
+    //   imm[0] is implicitly 0 (word aligned -- technically 2 byte alligned actually), so we shift left by 1.
+    uint32_t imm_20    = (instr_code >> 31) & 0x1;
+    uint32_t imm_10_1  = (instr_code >> 21) & 0x3FF;
+    uint32_t imm_11    = (instr_code >> 20) & 0x1;
+    uint32_t imm_19_12 = (instr_code >> 12) & 0xFF;
+
+    uint32_t imm_raw =
+        (imm_20 << 20) |
+        (imm_19_12 << 12) |
+        (imm_11 << 11) |
+        (imm_10_1 << 1);
+
+    // Sign-extend from bit 20 (total width 21 bits) in case of negative value
+    imm = sext(imm_raw, 21);
   } break;
 
   default:
@@ -334,47 +356,133 @@ std::shared_ptr<Instr> Core::decode(uint32_t instr_code) const {
   switch (opcode) {
   case Opcode::LUI: {
     // RV32I: LUI
-    alu_op = // TODO:
+    // LUI writes the upper immediate directly into rd
+    //0 + imm.
+    alu_op = AluOp::ADD;
     break;
   }
   case Opcode::AUIPC: {
     // RV32I: AUIPC
-    alu_op = // TODO:
-    exe_flags.alu_s1_PC = 1;
+    // AUIPC computes rd = PC + imm, so we use ADD with s1=PC and s2=imm.
+    // rd = PC + (imm << 12)
+    alu_op = AluOp::ADD;
+    exe_flags.alu_s1_PC = 1; // PC is the source1 for ADD
     break;
   }
   case Opcode::R: {
-    alu_op = // TODO:
+    // R-type ALU operations: decode based on func3 and func7
+    switch (func3) {
+    case 0:
+      switch (func7) {
+      case 0x00:
+        alu_op = AluOp::ADD;
+        break;
+      case 0x20:
+        alu_op = AluOp::SUB;
+        break;
+      case 0x01:
+        alu_op = AluOp::MUL;
+        break;
+      default:
+        std::abort();
+      }
+      break;
+    case 1:
+      alu_op = (func7 == 0x1) ? AluOp::MULH : AluOp::SLL;
+      break;
+    case 2:
+      alu_op = (func7 == 0x1) ? AluOp::MULHSU : AluOp::LTI;
+      break;
+    case 3:
+      alu_op = (func7 == 0x1) ? AluOp::MULHU : AluOp::LTU;
+      break;
+    case 4:
+      alu_op = AluOp::XOR;
+      break;
+    case 5:
+      alu_op = (func7 == 0x20) ? AluOp::SRA : AluOp::SRL;
+      break;
+    case 6:
+      alu_op = AluOp::OR;
+      break;
+    case 7:
+      alu_op = AluOp::AND;
+      break;
+    default:
+      std::abort();
+    }
+    break;
   }
   case Opcode::I: {
-    alu_op = // TODO: 
+    switch (func3){
+      case 0:
+        alu_op = AluOp::ADD;
+        break;
+      case 1:
+        alu_op = AluOp::SLL;
+        break;
+      case 2:
+        alu_op = AluOp::LTI;
+        break;
+      case 3:
+        alu_op = AluOp::LTU;
+        break;
+      case 4:
+        alu_op = AluOp::XOR;
+        break;
+      case 5:
+        alu_op = (func7 == 0x20) ? AluOp::SRA : AluOp::SRL;
+        break;
+      case 6:
+        alu_op = AluOp::OR;
+        break;
+      case 7:
+        alu_op = AluOp::AND;
+        break;
+      default:
+        std::abort();
+        break;
+    }
+    break;
   }
   case Opcode::B: {
-    exe_flags.alu_s1_PC = 1;
-    alu_op = // TODO:
-    br_op = // TODO:
+    exe_flags.alu_s1_PC = 1; // PC + imm 
+    alu_op = AluOp::ADD; // because we are adding PC and imm
+    switch (func3) {
+    case 0: br_op = BrOp::BEQ;  break;
+    case 1: br_op = BrOp::BNE;  break;
+    case 4: br_op = BrOp::BLT;  break;
+    case 5: br_op = BrOp::BGE;  break;
+    case 6: br_op = BrOp::BLTU; break;
+    case 7: br_op = BrOp::BGEU; break;
+    default:
+      std::abort();
+    }
     break;
   }
   case Opcode::JAL: {
     exe_flags.alu_s1_PC = 1;
-    alu_op = // TODO:
-    br_op = // TODO:
+    alu_op = AluOp::ADD;
+    br_op = BrOp::JAL;
     break;
   }
   case Opcode::JALR: {
-    alu_op = // TODO:
-    br_op = // TODO:
+    // JALR: jump to( rs1 + imm) & ~ 1 for 2 byte alignment and writes PC+4 to rd
+    alu_op = AluOp::ADD;
+    br_op = BrOp::JALR;
     break;
   }
   case Opcode::L: {
     // RV32I: LB, LH, LW, LBU, LHU
-    alu_op = // TODO:
+    // effective addy = rs1 + imm
+    alu_op = AluOp::ADD;
     exe_flags.is_load = 1;
     break;
   }
   case Opcode::S: {
-    // RV32I: SB, SH, SW
-    alu_op = // TODO:
+    // RV32I: SB, SH, SW 
+    // effective addy = rs1 + imm
+    alu_op = AluOp::ADD;
     exe_flags.is_store = 1;
     break;
   }
