@@ -17,8 +17,16 @@
 #pragma once
 
 #include <vector>
+#include <cstdint>
 
 namespace tinyrv {
+
+// BTB entry: valid bit, PC tag (for match), and target address
+struct BTB_entry_t {
+  bool     valid;
+  uint32_t tag;
+  uint32_t target;
+};
 
 class BranchPredictor {
 public:
@@ -45,6 +53,13 @@ public:
   void update(uint32_t PC, uint32_t next_PC, bool taken) override;
 
   // TODO: Add your own methods here
+private:
+  std::vector<BTB_entry_t> BTB_;
+  std::vector<uint8_t>    PHT_;   // 2-bit saturating counters (0–3)
+  uint32_t                BHR_;   // branch history register
+  uint32_t                BTB_shift_;
+  uint32_t                BTB_mask_;
+  uint32_t                BHR_mask_;
 };
 
 class GSharePlus : public BranchPredictor {
