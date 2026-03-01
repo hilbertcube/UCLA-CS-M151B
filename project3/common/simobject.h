@@ -1,0 +1,558 @@
+// Copyright 2024 Blaise Tine
+//
+// Licensed under the Apache License;
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <iostream>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "linked_list.h"
+#include "mempool.h"
+#include "util.h"
+#include "smallfunc.h"
+#include "ringqueue.h"
+
+class SimContext {
+private:
+  SimContext() = default;
+  friend class SimPlatform;
+};
+
+// Base class for all simulation objects (Nodes)
+class SimObjectBase {
+public:
+  using Ptr = std::shared_ptr<SimObjectBase>;
+  virtual ~SimObjectBase() = default;
+
+  const std::string& name() const { return name_; }
+
+protected:
+  SimObjectBase(const SimContext&, const std::string& name) : name_(name) {}
+
+private:
+  std::string name_;
+  virtual void do_reset() = 0;
+  virtual void do_tick()  = 0;
+  friend class SimPlatform;
+};
+
+// Base class for channels (Topological introspection)
+class SimChannelBase {
+public:
+  virtual ~SimChannelBase() = default;
+
+  // Introspection API
+  SimObjectBase* module() const { return module_; }
+  SimChannelBase* sink() const { return sink_; }
+  SimChannelBase* source() const { return source_; }
+
+  virtual bool empty() const = 0;
+  virtual bool full() const = 0;
+  virtual uint32_t size() const = 0;
+  virtual uint32_t capacity() const = 0;
+
+protected:
+  explicit SimChannelBase(SimObjectBase* module)
+      : module_(module)
+      , sink_(nullptr)
+      , source_(nullptr)
+  {}
+
+  virtual void reserve() = 0;
+
+  SimObjectBase*  module_;
+  SimChannelBase* sink_;
+  SimChannelBase* source_;
+
+  friend class SimPlatform;
+  template <typename T> friend class SimChannel;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Events
+///////////////////////////////////////////////////////////////////////////////
+
+class SimEventBase {
+public:
+  virtual ~SimEventBase() = default;
+  virtual void fire() = 0;
+  uint64_t cycles() const { return cycles_; }
+
+protected:
+  explicit SimEventBase(uint64_t cycles) : cycles_(cycles) {}
+  uint64_t cycles_;
+  LinkedListNode<SimEventBase> list_;
+  friend class SimPlatform;
+};
+
+// Optimized Event for Channel Transfers
+template <typename Pkt>
+class SimChannelEvent final : public SimEventBase {
+public:
+  template <typename P>
+  SimChannelEvent(SimChannel<Pkt>* channel, P&& pkt, uint64_t cycles)
+      : SimEventBase(cycles), channel_(channel), pkt_(std::forward<P>(pkt)) {}
+
+  void fire() override;
+
+  static void* operator new(std::size_t) { return allocator_.allocate(1); }
+  static void operator delete(void* ptr, std::size_t) noexcept {
+    allocator_.deallocate(static_cast<SimChannelEvent<Pkt>*>(ptr), 1);
+  }
+
+private:
+  SimChannel<Pkt>* channel_;
+  Pkt pkt_;
+  static inline PoolAllocator<SimChannelEvent<Pkt>, 128> allocator_;
+};
+
+// Generic Event for arbitrary callbacks
+template <typename Pkt>
+class SimCallEvent final : public SimEventBase {
+public:
+  using Func = SmallFunction<void(const Pkt&), 48>;
+
+  template <typename F>
+  SimCallEvent(F&& func, Pkt pkt, uint64_t cycles)
+    : SimEventBase(cycles), func_(std::forward<F>(func)), pkt_(std::move(pkt)) {}
+
+  void fire() override { func_(pkt_); }
+
+  static void* operator new(std::size_t) { return allocator_.allocate(1); }
+  static void operator delete(void* ptr, std::size_t) noexcept {
+    allocator_.deallocate(static_cast<SimCallEvent<Pkt>*>(ptr), 1);
+  }
+
+private:
+  Func func_;
+  Pkt  pkt_;
+  static inline PoolAllocator<SimCallEvent<Pkt>, 64> allocator_;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// SimPlatform
+///////////////////////////////////////////////////////////////////////////////
+
+class SimPlatform {
+public:
+  static SimPlatform& instance() {
+    static SimPlatform s_inst;
+    return s_inst;
+  }
+
+  bool initialize() { return true; }
+  void finalize() { cleanup(); }
+
+  uint64_t cycles() const { return cycles_; }
+
+  // Factory
+  template <typename Impl, typename... Args>
+  std::shared_ptr<Impl> create_object(Args&&... args);
+
+  // Scheduling API
+  template <typename Pkt, typename Func>
+  void schedule(Func&& func, const Pkt& pkt, uint64_t delay);
+
+  void reset();
+  void tick();
+
+private:
+  // Timing Wheel Configuration
+  static constexpr uint64_t WHEEL_SIZE = 4096;
+  static constexpr uint64_t WHEEL_MASK = WHEEL_SIZE - 1;
+
+  SimPlatform() : reg_events_(WHEEL_SIZE), cycles_(0), delta_(0) {}
+  ~SimPlatform() { cleanup(); }
+
+  void cleanup();
+  void fire_immediate_events();
+
+  template <typename Pkt>
+  void schedule(SimChannel<Pkt>* channel, const Pkt& pkt, uint64_t delay);
+
+  template <typename Pkt>
+  void schedule(SimChannel<Pkt>* channel, Pkt&& pkt, uint64_t delay);
+
+  std::vector<std::shared_ptr<SimObjectBase>> objects_;
+
+  std::vector<LinkedList<SimEventBase, &SimEventBase::list_>> reg_events_;
+
+  LinkedList<SimEventBase, &SimEventBase::list_> imm_events_;
+
+  uint64_t cycles_;
+  uint32_t delta_;
+
+  template <typename U> friend class SimChannel;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// SimChannel Implementation
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename Pkt>
+class SimChannel : public SimChannelBase {
+public:
+  static_assert(std::is_copy_constructible_v<Pkt>, "Packet must be copy constructible");
+  using TxCallback = SmallFunction<void(const Pkt&, uint64_t), 48>;
+
+  SimChannel(SimObjectBase* module, uint32_t capacity = 2)
+    : SimChannelBase(module)
+    , storage_(capacity)
+    , pending_count_(0) {}
+
+  SimChannel(const SimChannel& other)
+    : SimChannelBase(other.module_)
+    , storage_(other.storage_.capacity())
+    , pending_count_(0)
+    , convert_fn_(other.convert_fn_)
+    , tx_cb_(other.tx_cb_) {
+    sink_ = nullptr;
+    source_ = nullptr;
+  }
+
+  SimChannel& operator=(const SimChannel& other) {
+    if (this != &other) {
+      this->module_ = other.module_;
+      sink_ = nullptr;
+      source_ = nullptr;
+      storage_ = RingQueue<Pkt>(other.storage_.capacity());
+      pending_count_ = 0;
+      convert_fn_ = other.convert_fn_;
+      tx_cb_ = other.tx_cb_;
+    }
+    return *this;
+  }
+
+  void bind(SimChannel<Pkt>* sink) {
+    this->bind_setup(sink);
+    convert_fn_.reset();
+  }
+
+  template <typename U, typename Converter>
+  void bind(SimChannel<U>* sink, Converter&& converter) {
+    static_assert(std::is_invocable_r_v<U, Converter, Pkt>, "Converter signature mismatch");
+    this->bind_setup(sink);
+    convert_fn_ = [sink, conv = std::forward<Converter>(converter)](const Pkt& pkt) {
+      sink->receive_packet(conv(pkt));
+    };
+  }
+
+  template <typename U, typename = std::enable_if_t<std::is_convertible_v<Pkt, U>>>
+  void bind(SimChannel<U>* sink) {
+    this->bind_setup(sink);
+    convert_fn_ = [sink](const Pkt& pkt) {
+      sink->receive_packet(pkt);
+    };
+  }
+
+  template <typename F>
+  void tx_callback(F&& callback) { tx_cb_ = std::forward<F>(callback); }
+
+  bool full() const override {
+    if (sink_) return sink_->full();
+    return this->occupancy() >= storage_.capacity();
+  }
+
+  void send(const Pkt& pkt, uint64_t delay = 1) {
+    __assert(!this->full(), "channel is full");
+    this->reserve();
+    SimPlatform::instance().schedule(this, pkt, delay);
+  }
+
+  void send(Pkt&& pkt, uint64_t delay = 1) {
+    __assert(!this->full(), "channel is full");
+    this->reserve();
+    SimPlatform::instance().schedule(this, std::move(pkt), delay);
+  }
+
+  [[nodiscard]] bool try_send(const Pkt& pkt, uint64_t delay = 1) {
+    if (this->full()) return false;
+    this->send(pkt, delay);
+    return true;
+  }
+
+  [[nodiscard]] bool try_send(Pkt&& pkt, uint64_t delay = 1) {
+    if (this->full()) return false;
+    this->send(std::move(pkt), delay);
+    return true;
+  }
+
+  bool empty() const override {
+    this->assert_endpoint();
+    return this->queue_empty();
+  }
+
+  const Pkt& peek() const {
+    this->assert_endpoint();
+    __assert(!this->queue_empty(), "channel is empty");
+    return this->queue_front();
+  }
+
+  void pop() {
+    this->assert_endpoint();
+    __assert(!this->queue_empty(), "channel is empty");
+    this->queue_pop();
+  }
+
+  [[nodiscard]] bool try_pop(Pkt* out) {
+    __assert(out != nullptr, "output target is null");
+    if (this->empty()) return false;
+    *out = this->peek();
+    this->pop();
+    return true;
+  }
+
+  uint32_t size() const override {
+    if (sink_) return sink_->size();
+    return this->occupancy();
+  }
+
+  uint32_t capacity() const override {
+    if (sink_) return sink_->capacity();
+    return storage_.capacity();
+  }
+
+protected:
+  void reserve() override {
+    if (sink_) {
+      sink_->reserve();
+    } else {
+      ++pending_count_;
+    }
+  }
+
+  void receive_packet(const Pkt& pkt) {
+    if (tx_cb_) {
+      tx_cb_(pkt, SimPlatform::instance().cycles());
+    }
+    if (sink_) {
+      if (convert_fn_) {
+        convert_fn_(pkt);
+      } else {
+        auto* sink = static_cast<SimChannel<Pkt>*>(sink_);
+        sink->receive_packet(pkt);
+      }
+      return;
+    }
+    __assert(pending_count_ > 0, "pending count underflow");
+    --pending_count_;
+    this->queue_push(pkt);
+  }
+
+private:
+  bool forwarded() const { return sink_ != nullptr; }
+
+  void bind_setup(SimChannelBase* sink) {
+    __assert(sink != nullptr, "bind target is null");
+    __assert(sink_ == nullptr, "channel already bound");
+    sink_ = sink;
+    sink->source_ = this;
+  }
+
+  void assert_endpoint() const {
+    __assert(!forwarded(), "cannot read from a forwarded channel");
+  }
+
+  uint32_t occupancy() const { return this->queue_size() + pending_count_; }
+
+  bool queue_empty() const { return storage_.empty(); }
+  uint32_t queue_size() const { return storage_.size(); }
+  const Pkt& queue_front() const { return storage_.front(); }
+  void queue_pop() { storage_.pop(); }
+  void queue_push(const Pkt& pkt) { storage_.push(pkt); }
+
+  RingQueue<Pkt> storage_;
+  uint32_t pending_count_;
+  SmallFunction<void(const Pkt&), 48> convert_fn_;
+  TxCallback tx_cb_;
+
+  template <typename U> friend class SimChannel;
+  template <typename U> friend class SimChannelEvent;
+  friend class SimChannelBase;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Object Creation & Platform Implementation
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename Impl>
+class SimObject : public SimObjectBase {
+public:
+  using Ptr = std::shared_ptr<Impl>;
+
+  template <typename... Args>
+  static Ptr Create(Args&&... args) {
+    return SimPlatform::instance().create_object<Impl>(std::forward<Args>(args)...);
+  }
+
+protected:
+  SimObject(const SimContext& ctx, const std::string& name)
+    : SimObjectBase(ctx, name) {}
+
+private:
+  Impl* impl() { return static_cast<Impl*>(this); }
+  void do_reset() override { impl()->reset(); }
+  void do_tick()  override { impl()->tick();  }
+};
+
+template <typename Impl, typename... Args>
+std::shared_ptr<Impl> SimPlatform::create_object(Args&&... args) {
+  auto obj = std::make_shared<Impl>(SimContext{}, std::forward<Args>(args)...);
+  objects_.push_back(obj);
+  return obj;
+}
+
+template <typename Pkt>
+void SimPlatform::schedule(SimChannel<Pkt>* channel, const Pkt& pkt, uint64_t delay) {
+  if (delay == 0) {
+    auto evt = new SimChannelEvent<Pkt>(channel, pkt, delta_);
+    imm_events_.push_back(evt);
+    ++delta_;
+  } else {
+    uint64_t fire_cycle = cycles_ + delay;
+    auto evt = new SimChannelEvent<Pkt>(channel, pkt, fire_cycle);
+    reg_events_[fire_cycle & WHEEL_MASK].push_back(evt);
+  }
+}
+
+template <typename Pkt>
+void SimPlatform::schedule(SimChannel<Pkt>* channel, Pkt&& pkt, uint64_t delay) {
+  if (delay == 0) {
+    auto evt = new SimChannelEvent<Pkt>(channel, std::move(pkt), delta_);
+    imm_events_.push_back(evt);
+    ++delta_;
+  } else {
+    uint64_t fire_cycle = cycles_ + delay;
+    auto evt = new SimChannelEvent<Pkt>(channel, std::move(pkt), fire_cycle);
+    reg_events_[fire_cycle & WHEEL_MASK].push_back(evt);
+  }
+}
+
+template <typename Pkt, typename Func>
+void SimPlatform::schedule(Func&& func, const Pkt& pkt, uint64_t delay) {
+  if (delay == 0) {
+    auto evt = new SimCallEvent<Pkt>(std::forward<Func>(func), pkt, delta_);
+    imm_events_.push_back(evt);
+    ++delta_;
+  } else {
+    uint64_t fire_cycle = cycles_ + delay;
+    auto evt = new SimCallEvent<Pkt>(std::forward<Func>(func), pkt, fire_cycle);
+    reg_events_[fire_cycle & WHEEL_MASK].push_back(evt);
+  }
+}
+
+inline void SimPlatform::reset() {
+  // Clear any lingering events from the previous run
+  for (auto& bucket : reg_events_) {
+    while(!bucket.empty()) {
+      auto it = bucket.begin();
+      auto evt = &*it;
+      bucket.erase(it);
+      delete evt; // Return to pool
+    }
+  }
+
+  // Clear immediate events
+  while(!imm_events_.empty()) {
+    auto it = imm_events_.begin();
+    auto evt = &*it;
+    imm_events_.erase(it);
+    delete evt;
+  }
+
+  // clear sim objects
+  for (auto& object : objects_) {
+    object->do_reset();
+  }
+
+  // Reset timing
+  cycles_ = 0;
+  delta_ = 0;
+}
+
+inline void SimPlatform::tick() {
+  // Process immediate events first
+  fire_immediate_events();
+  for (auto& object : objects_) {
+    object->do_tick();
+    fire_immediate_events();
+  }
+  ++cycles_;
+
+  // Process registered events
+  auto& bucket = reg_events_[cycles_ & WHEEL_MASK];
+  if (!bucket.empty()) {
+    for (auto it = bucket.begin(); it != bucket.end();) {
+      auto evt = &*it;
+      if (evt->cycles() <= cycles_) {
+        evt->fire();
+        it = bucket.erase(it);
+        delete evt; // Returns to PoolAllocator
+      } else {
+        ++it; // Future wraparound event
+      }
+    }
+  }
+}
+
+inline void SimPlatform::cleanup() {
+  objects_.clear();
+
+  for (auto& bucket : reg_events_) {
+    while(!bucket.empty()) {
+      auto it = bucket.begin();
+      auto evt = &*it;
+      bucket.erase(it);
+      delete evt;
+    }
+  }
+
+  while(!imm_events_.empty()) {
+    auto it = imm_events_.begin();
+    auto evt = &*it;
+    imm_events_.erase(it);
+    delete evt;
+  }
+  cycles_ = 0;
+  delta_ = 0;
+}
+
+inline void SimPlatform::fire_immediate_events() {
+  for (uint32_t d = 0; d < delta_; ++d) {
+    for (auto it = imm_events_.begin(); it != imm_events_.end();) {
+      auto evt = &*it;
+      if (evt->cycles() == d) {
+        evt->fire();
+        it = imm_events_.erase(it);
+        delete evt;
+      } else {
+        ++it;
+      }
+    }
+  }
+  delta_ = 0;
+}
+
+template <typename Pkt>
+void SimChannelEvent<Pkt>::fire() {
+  channel_->receive_packet(pkt_);
+}

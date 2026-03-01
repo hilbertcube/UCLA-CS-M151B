@@ -19,76 +19,114 @@
 #include <cstdint>
 #include <vector>
 
-namespace tinyrv {
+namespace tinyrv
+{
 
-// BTB entry: valid bit, PC tag (for match), and target address
-struct BTB_entry_t {
-  bool valid;
-  uint32_t tag;
-  uint32_t target;
-};
-
-class BranchPredictor {
-public:
-  virtual ~BranchPredictor() {}
-
-  virtual uint32_t predict(uint32_t PC) { return PC + 4; };
-
-  virtual void update(uint32_t PC, uint32_t next_PC, bool taken) {
-    (void)PC;
-    (void)next_PC;
-    (void)taken;
+  // BTB entry
+  struct BTB_entry_t
+  {
+    bool valid;
+    uint32_t tag;
+    uint32_t target;
   };
-};
 
-class GShare : public BranchPredictor {
-public:
-  GShare(uint32_t BTB_size, uint32_t BHR_size);
+  class BranchPredictor
+  {
+  public:
+    virtual ~BranchPredictor() {}
 
-  ~GShare() override;
+    virtual uint32_t predict(uint32_t PC) { return PC + 4; };
 
-  uint32_t predict(uint32_t PC) override;
-  void update(uint32_t PC, uint32_t next_PC, bool taken) override;
+    virtual void update(uint32_t PC, uint32_t next_PC, bool taken)
+    {
+      (void)PC;
+      (void)next_PC;
+      (void)taken;
+    };
+  };
 
-  // TODO: Add your own methods here
-private:
-  std::vector<BTB_entry_t> BTB_;
-  std::vector<uint8_t> PHT_; // 2-bit saturating counters (0–3)
-  uint32_t BHR_;             // branch history register
-  uint32_t BTB_shift_;
-  uint32_t BTB_mask_;
-  uint32_t BHR_mask_;
-};
+  class GShare : public BranchPredictor
+  {
+  public:
+    GShare(uint32_t BTB_size, uint32_t BHR_size);
 
-class GSharePlus : public BranchPredictor {
-public:
-  GSharePlus(uint32_t BTB_size, uint32_t BHR_size);
+    ~GShare() override;
 
-  ~GSharePlus() override;
+    uint32_t predict(uint32_t PC) override;
+    void update(uint32_t PC, uint32_t next_PC, bool taken) override;
 
-  uint32_t predict(uint32_t PC) override;
-  void update(uint32_t PC, uint32_t next_PC, bool taken) override;
+    // TODO: Add your own methods here
+  private:
+    std::vector<BTB_entry_t> BTB_;
+    std::vector<uint8_t> PHT_; // 2-bit counters
+    uint32_t BHR_;             // branch history reg
+    uint32_t BTB_shift_;
+    uint32_t BTB_mask_;
+    uint32_t BHR_mask_;
+  };
 
-  // TODO: extra credit component
-private:
-  // BTB (shared)
-  std::vector<BTB_entry_t> BTB_;
-  uint32_t BTB_mask_;
+  class GSharePlus : public BranchPredictor
+  {
+  public:
+    GSharePlus(uint32_t BTB_size, uint32_t BHR_size);
 
-  // Global predictor (GShare): GHR XOR PC indexes into global PHT
-  std::vector<uint8_t> global_PHT_; // 2-bit saturating counters
-  uint32_t GHR_;                    // global history register
-  uint32_t GHR_mask_;
+    ~GSharePlus() override;
 
-  // Local predictor: per-branch local history table -> local PHT
-  std::vector<uint32_t> local_HT_; // local history table (per-PC histories)
-  std::vector<uint8_t> local_PHT_; // 2-bit saturating counters
-  uint32_t local_HT_mask_;
-  uint32_t local_PHT_mask_;
+    uint32_t predict(uint32_t PC) override;
+    void update(uint32_t PC, uint32_t next_PC, bool taken) override;
 
-  // Meta/chooser table: 2-bit counters; 0,1 -> global; 2,3 -> local
-  std::vector<uint8_t> meta_;
-  uint32_t meta_mask_;
-};
+    // TODO: extra credit component
+  private:
+    // BTB
+    std::vector<BTB_entry_t> BTB_;
+    uint32_t BTB_mask_;
+
+    // TAGE predictor
+    enum
+    {
+      NTABLES = 5,
+      BASE_SIZE = 4096,
+      TAG_BITS = 10
+    };
+
+    // bimodal base table
+    std::vector<uint8_t> base_; // 2-bit counters
+
+    struct TagEntry
+    {
+      int8_t ctr;     // 3-bit signed counter (-4..3)
+      uint16_t tag;   // partial tag
+      uint8_t useful; // usefulness (0..3)
+    };
+
+    // tagged tables (geometric history lengths)
+    std::vector<TagEntry> table_[NTABLES];
+    uint32_t tsize_[NTABLES];
+    uint32_t tmask_[NTABLES];
+    uint32_t thist_[NTABLES];
+
+    uint64_t ghist_; // global history
+    uint32_t phist_; // path history
+
+    // for periodic useful-bit reset
+    uint32_t reset_ctr_;
+    bool reset_phase_;
+
+    // saved prediction state so update() can reuse it
+    struct PredInfo
+    {
+      int provider;       // longest-history hit (-1 = base)
+      int altprovider;    // 2nd longest hit (-1 = base)
+      bool pred;          // final prediction
+      bool provider_pred; // what provider says
+      bool alt_pred;      // what altpred says
+    };
+    PredInfo compute_pred(uint32_t PC) const;
+
+    // hashing helpers
+    uint32_t fold(uint64_t val, int srclen, int dstlen) const;
+    uint32_t gindex(uint32_t pc, int t) const;
+    uint16_t gtag(uint32_t pc, int t) const;
+  };
 
 } // namespace tinyrv
