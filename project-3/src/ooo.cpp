@@ -23,63 +23,102 @@
 
 using namespace tinyrv;
 
-void Core::issue() {
+void Core::issue()
+{
   // check input
   if (issue_queue_->empty())
     return;
 
-  auto& is_data = issue_queue_->data();
+  auto &is_data = issue_queue_->data();
   auto instr = is_data.instr;
   auto exe_flags = instr->getExeFlags();
   bool is_lsu = (instr->getFUType() == FUType::LSU);
 
   // check for structural hazards
-  // TODO
+  if (ROB_.full() || RS_.full())
+    return;
+  if (is_lsu && LSQ_->full())
+    return;
 
   uint32_t rs1_data = 0, rs2_data = 0;
   uint32_t rs1_rob = -1, rs2_rob = -1;
 
   // load rs1 data
-  // check the RAT if value is in the registe file
-  // if not in the register file, check data is in the ROB
-  // else set rs1_rob to the rob entry producing the data
-  // remember to first check if the instruction actually uses rs1
-  // HINT: should use RAT, ROB, and reg_file_
-  // TODO:
+  if (exe_flags.use_rs1)
+  {
+    if (RAT_.exists(instr->getRs1()))
+    {
+      uint32_t rob_idx = RAT_.get(instr->getRs1());
+      auto &rob_entry = ROB_.get_entry(rob_idx);
+      if (rob_entry.ready)
+      {
+        rs1_data = rob_entry.result;
+      }
+      else
+      {
+        rs1_rob = rob_idx;
+      }
+    }
+    else
+    {
+      rs1_data = reg_file_[instr->getRs1()];
+    }
+  }
 
   // load rs2 data
-  // check the RAT if value is in the registe file
-  // if not in the register file, check data is in the ROB
-  // else set rs2_rob to the rob entry producing the data
-  // remember to first check if the instruction actually uses rs1
-  // HINT: should use RAT, ROB, and reg_file_
-  // TODO:
+  if (exe_flags.use_rs2)
+  {
+    if (RAT_.exists(instr->getRs2()))
+    {
+      uint32_t rob_idx = RAT_.get(instr->getRs2());
+      auto &rob_entry = ROB_.get_entry(rob_idx);
+      if (rob_entry.ready)
+      {
+        rs2_data = rob_entry.result;
+      }
+      else
+      {
+        rs2_rob = rob_idx;
+      }
+    }
+    else
+    {
+      rs2_data = reg_file_[instr->getRs2()];
+    }
+  }
 
   // allocate new ROB entry
   uint32_t rob_tag = ROB_.allocate(instr);
 
   // update the RAT if instruction is writing to the register file
-  if (instr->getExeFlags().use_rd) {
+  if (instr->getExeFlags().use_rd)
+  {
     RAT_.set(instr->getRd(), rob_tag);
   }
 
 #ifdef BP_ENABLE
   // Save checkpoint after RAT update so branches that write rd (JAL/JALR)
   // keep their mapping during recovery.
-  if (instr->getBrOp() != BrOp::NONE) {
-    if (!checkpoints_.save(rob_tag, RAT_)) {
+  if (instr->getBrOp() != BrOp::NONE)
+  {
+    if (!checkpoints_.save(rob_tag, RAT_))
+    {
       std::abort();
     }
   }
 #endif
 
-  if (is_lsu) {
+  if (is_lsu)
+  {
     // allocate LSQ entry and set instruction metadata
-    // TODO:
+    uint32_t lsq_idx = LSQ_->allocate(rob_tag, instr);
+    instr_meta_t meta;
+    meta.lsu.lsq_idx = lsq_idx;
+    instr->setMetaData(meta);
   }
 
   // issue instruction to reservation station
-  // TODO:
+  RS_.issue(rob_tag, rs1_rob, rs2_rob, rs1_data, rs2_data, instr);
 
   DT(2, "Issue: " << *instr);
 
@@ -87,8 +126,10 @@ void Core::issue() {
   issue_queue_->pop();
 }
 
-void Core::execute() {
-  if (flush_pending_) {
+void Core::execute()
+{
+  if (flush_pending_)
+  {
     DT(2, "Flush: misprediction, rob=0x" << std::hex << flush_rob_ << ", pc=0x" << flush_pc_ << std::dec);
     this->pipeline_flush();
   }
@@ -97,47 +138,63 @@ void Core::execute() {
   // and push its output result to the common data bus
   // The CDB can only serve one functional unit per cycle
   // HINT: should use CDB_ and FUs_
-  for (auto fu : FUs_) {
-    // TODO:
+  for (auto fu : FUs_)
+  {
+    if (!fu->empty() && CDB_.empty())
+    {
+      CDB_.push(fu->pop());
+    }
   }
 
   // schedule ready instructions to corresponding functional units
   // iterate through all reservation stations, check if the entry is valid, and operands are ready
   // once a candidate is found, issue the instruction to its corresponding nont-busy functional uni.
   // HINT: should use RS_ and FUs_
-  for (uint32_t rs_index = 0; rs_index < RS_.size(); ++rs_index) {
-    auto& entry = RS_.get_entry(rs_index);
-    // TODO:
+  for (uint32_t rs_index = 0; rs_index < RS_.size(); ++rs_index)
+  {
+    auto &entry = RS_.get_entry(rs_index);
+    if (!entry.valid || !entry.operands_ready())
+      continue;
+    auto fu_type = entry.instr->getFUType();
+    auto fu = FUs_.at((int)fu_type);
+    if (fu->full())
+      continue;
+    fu->push(entry.instr, entry.rd_rob, entry.rs1_data, entry.rs2_data);
+    RS_.release(rs_index);
   }
 }
 
-void Core::writeback() {
+void Core::writeback()
+{
   // check input
   if (CDB_.empty())
     return;
 
   // CDB broadcast
-  auto& cdb_data = CDB_.result();
+  auto &cdb_data = CDB_.result();
 
   // update reservation stations waiting for operands
-  for (uint32_t rs_index = 0; rs_index < RS_.size(); ++rs_index) {
-    auto& entry = RS_.get_entry(rs_index);
-    if (entry.valid) {
-      // TODO:
+  for (uint32_t rs_index = 0; rs_index < RS_.size(); ++rs_index)
+  {
+    auto &entry = RS_.get_entry(rs_index);
+    if (entry.valid)
+    {
+      entry.update_operands(cdb_data);
     }
   }
 
   // update ROB
-  // TODO:
+  ROB_.update(cdb_data);
 
   // clear CDB
-  // TODO:
+  CDB_.pop();
 
   RS_.dump();
   LSQ_->dump();
 }
 
-void Core::commit() {
+void Core::commit()
+{
   // check input
   if (ROB_.empty())
     return;
@@ -145,29 +202,38 @@ void Core::commit() {
   // commit ROB head entry
   uint32_t head_index = ROB_.head_index();
   uint32_t head_tag = ROB_.head_tag();
-  auto& rob_head = ROB_.get_entry(head_index);
-  if (rob_head.ready) {
+  auto &rob_head = ROB_.get_entry(head_index);
+  if (rob_head.ready)
+  {
     auto instr = rob_head.instr;
     auto exe_flags = instr->getExeFlags();
 
     // Notify LSQ to commit if instruction is load/store
-    // TODO:
+    if (exe_flags.is_load || exe_flags.is_store)
+    {
+      LSQ_->commit(head_tag);
+    }
 
     // update register file if needed
-    // TODO:
+    if (exe_flags.use_rd)
+    {
+      reg_file_[instr->getRd()] = rob_head.result;
+    }
 
     // clear the RAT if still pointing to this ROB entry
-    if (exe_flags.use_rd && RAT_.exists(instr->getRd())) {
+    if (exe_flags.use_rd && RAT_.exists(instr->getRd()))
+    {
       RAT_.clear_mapping(instr->getRd(), head_tag);
     }
 
     // clear checkpoint RAT mappings
-    if (exe_flags.use_rd) {
+    if (exe_flags.use_rd)
+    {
       checkpoints_.clear_RAT_mapping(instr->getRd(), head_tag);
     }
 
     // pop ROB entry
-    // TODO:
+    ROB_.pop();
 
     DT(2, "Commit: " << *instr);
 
@@ -175,7 +241,8 @@ void Core::commit() {
     ++perf_stats_.instrs;
 
     // handle program termination
-    if (exe_flags.is_exit) {
+    if (exe_flags.is_exit)
+    {
       exited_ = true;
     }
   }
@@ -183,17 +250,25 @@ void Core::commit() {
   ROB_.dump();
 }
 
-void Core::pipeline_flush() {
+void Core::pipeline_flush()
+{
   // restore RAT from current flush checkpoint
-  // TODO:
+  checkpoints_.restore(flush_rob_, &RAT_);
 
   // invalidate younger instructions in pipeline structures
-  // include chejckpoints, ROB, reservation stations, LSQ, CDB, and functional units
-  // TOOD:
+  checkpoints_.invalidate(flush_rob_);
+  ROB_.invalidate(flush_rob_);
+  RS_.invalidate(flush_rob_);
+  LSQ_->invalidate(flush_rob_);
+  CDB_.invalidate(flush_rob_);
+  for (auto fu : FUs_)
+  {
+    fu->invalidate(flush_rob_);
+  }
 
   // reset pipeline queues and states
-  // include decode/issue queue
-  // TODO:
+  decode_queue_->reset();
+  issue_queue_->reset();
   exit_pending_ = false;
   fetch_lock_->write(false);
 

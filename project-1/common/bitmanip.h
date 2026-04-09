@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <assert.h>
+#include <algorithm>
 
 constexpr uint32_t count_leading_zeros(uint32_t value) {
   return value ? __builtin_clz(value) : 32;

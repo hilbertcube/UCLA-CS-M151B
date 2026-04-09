@@ -21,25 +21,23 @@
 using namespace tinyrv;
 
 ReorderBuffer::ReorderBuffer(uint32_t size)
-  : store_(size)
-  , head_index_(0)
-  , tail_index_(0)
-  , count_(0)
-  , phase_bit_(0)
-  , index_mask_(size - 1)
+    : store_(size), head_index_(0), tail_index_(0), count_(0), phase_bit_(0), index_mask_(size - 1)
 {
   assert(size && ((size & (size - 1)) == 0));
-  for (auto& entry : store_) {
+  for (auto &entry : store_)
+  {
     entry.valid = false;
     entry.ready = false;
   }
 }
 
-ReorderBuffer::~ReorderBuffer() {
+ReorderBuffer::~ReorderBuffer()
+{
   //--
 }
 
-uint32_t ReorderBuffer::allocate(Instr::Ptr instr) {
+uint32_t ReorderBuffer::allocate(Instr::Ptr instr)
+{
   assert(!this->full());
   uint32_t index = tail_index_;
   auto size = store_.size();
@@ -48,32 +46,39 @@ uint32_t ReorderBuffer::allocate(Instr::Ptr instr) {
   store_[index] = {true, false, 0, tag, instr};
   // Compute tag: [phase_bit | index]
   tail_index_ = (index + 1) & mask;
-  if (tail_index_ == 0) {
+  if (tail_index_ == 0)
+  {
     phase_bit_ ^= 0x1; // flip phase on wrap
   }
   ++count_;
   return tag;
 }
 
-void ReorderBuffer::update(const CDBResult& result) {
+void ReorderBuffer::update(const CDBResult &result)
+{
   auto index = result.rob_tag & index_mask_;
-  auto& entry = store_[index];
+  auto &entry = store_[index];
   // Stale CDB broadcasts can occur across flush boundaries.
   // Ignore updates that no longer map to a live ROB entry.
   if (!entry.valid || entry.ready)
     return;
 
-  // Udate the ROB entry
-  // TODO:
+  // Update the ROB entry
+  entry.ready = true;
+  entry.result = result.value;
 
-  if (entry.instr->getExeFlags().use_rd) {
+  if (entry.instr->getExeFlags().use_rd)
+  {
     DT(2, "Writeback: value=0x" << std::hex << result.value << std::dec << ", " << *entry.instr);
-  } else {
+  }
+  else
+  {
     DT(2, "Writeback: " << *entry.instr);
   }
 }
 
-void ReorderBuffer::invalidate(uint32_t rob_tag) {
+void ReorderBuffer::invalidate(uint32_t rob_tag)
+{
   if (this->empty())
     return;
 
@@ -88,7 +93,8 @@ void ReorderBuffer::invalidate(uint32_t rob_tag) {
   if (removed == 0)
     return;
 
-  for (uint32_t i = 0; i < removed; ++i) {
+  for (uint32_t i = 0; i < removed; ++i)
+  {
     auto tag = (new_tail_tag + i) & mask2;
     auto index = tag & mask;
     store_[index].valid = false;
@@ -101,7 +107,8 @@ void ReorderBuffer::invalidate(uint32_t rob_tag) {
   phase_bit_ = (new_tail_tag / size) & 0x1;
 }
 
-uint32_t ReorderBuffer::pop() {
+uint32_t ReorderBuffer::pop()
+{
   assert(!this->empty() && store_[head_index_].valid && store_[head_index_].ready);
   store_[head_index_].valid = false;
   store_[head_index_].ready = false;
@@ -110,10 +117,13 @@ uint32_t ReorderBuffer::pop() {
   return head_index_;
 }
 
-void ReorderBuffer::dump() {
-  for (uint32_t i = 0; i < store_.size(); ++i) {
-    auto& entry = store_[i];
-    if (entry.valid) {
+void ReorderBuffer::dump()
+{
+  for (uint32_t i = 0; i < store_.size(); ++i)
+  {
+    auto &entry = store_[i];
+    if (entry.valid)
+    {
       DT(4, "ROB[" << i << "] ready=" << entry.ready << ", head=" << (i == head_index_) << " (#" << entry.instr->getId() << ")");
     }
   }
